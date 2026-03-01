@@ -1,215 +1,111 @@
-# Global Factor Selector Implementation
+# Global Factor Selector: Methodology & Documentation
 
-This document contains a Python implementation of the iterative Double-Selection LASSO method based on **Feng, Giglio, & Xiu (2020) "Taming the Factor Zoo"**.
+## Overview
 
-This version includes improvements for:
-1.  **Feature Scaling:** Essential for LASSO stability.
-2.  **Multiple Testing Correction:** Bonferroni adjustment to mitigate the Winner's Curse.
+This module implements the **Iterative Double-Selection LASSO** method for asset pricing, based on the framework established by **Feng, Giglio, & Xiu (2020)** in their paper *"Taming the Factor Zoo"*.
 
-## Python Script
+The primary goal of this tool is to identify specific risk factors that provide independent pricing information from a high-dimensional set of candidate factors, effectively separating true pricing signals from redundant factors or noise.
 
-You can copy the code block below and save it as `factor_selector.py`.
+### Key Capabilities
+1.  **Double-Selection LASSO:** Mitigates omitted variable bias when evaluating candidate factors.
+2.  **Iterative Selection:** Sequentially selects the most significant factors until no remaining candidates exceed the significance threshold.
+3.  **Feature Scaling:** Optional standardization to ensure LASSO regularization performs correctly across factors with different units/volatilities.
+4.  **Multiple Testing Correction:** Optional dynamic Bonferroni adjustment to control the Family-Wise Error Rate (FWER) and mitigate the "Winner's Curse."
 
-```python
-import numpy as np
-import statsmodels.api as sm
-from sklearn.linear_model import LassoCV
-from sklearn.preprocessing import StandardScaler
-from scipy import stats
+---
 
-class GlobalFactorSelector:
-    """
-    GlobalFactorSelector: An implementation of the iterative Double-Selection LASSO method
-    based on Feng, Giglio, & Xiu (2020) "Taming the Factor Zoo".
+## Mathematical Framework
 
-    Now includes improvements for:
-    1. Feature Scaling (essential for LASSO).
-    2. Multiple Testing Correction (to mitigate Winner's Curse).
-    """
-    def __init__(self, r_bar, H, G, candidate_categories,
-                 t_threshold=1.64, cv=5, random_state=0, tol=1e-6,
-                 scale_inputs=False, adjustment_method='none', significance_level=0.10):
-        """
-        New Parameters:
-        ---------------
-        scale_inputs : bool, default False
-            If True, standardizes H and G (zero mean, unit variance) before running.
-            Recommended for LASSO stability.
-        adjustment_method : str, default 'none'
-            'none': Uses fixed t_threshold.
-            'bonferroni': Dynamically adjusts threshold based on number of candidates tested
-                          in each iteration (reduces false positives).
-        significance_level : float, default 0.10
-            Used only if adjustment_method is not 'none'. The base alpha for correction.
-            (e.g., 0.10 corresponds to initial t approx 1.64).
-        """
-        self.r_bar = r_bar
-        # Copy to avoid modifying original data arrays
-        self.H_raw = H.copy()
-        self.G_raw = G.copy()
-        self.candidate_categories = candidate_categories
-        self.t_threshold = t_threshold
-        self.cv = cv
-        self.random_state = random_state
-        self.tol = tol
+The algorithm operates on the linear factor model structure:
 
-        # Improvement 1: Store Scaling and Correction preferences
-        self.scale_inputs = scale_inputs
-        self.adjustment_method = adjustment_method
-        self.significance_level = significance_level
-        self.scaler_H = StandardScaler()
-        self.scaler_G = StandardScaler()
+$$r_t = \alpha + \beta_H H_t + \beta_g g_t + \epsilon_t$$
 
-    def _prepare_data(self):
-        """
-        Internal method to handle data scaling if enabled.
-        """
-        if self.scale_inputs:
-            # Fit/Transform H and G.
-            # Note: We do NOT scale r_bar as it represents the target risk premia.
-            H_scaled = self.scaler_H.fit_transform(self.H_raw)
-            G_scaled = self.scaler_G.fit_transform(self.G_raw)
-            return H_scaled, G_scaled
-        else:
-            return self.H_raw, self.G_raw
+Where:
+* **$r_t$**: The target asset returns (or risk premia).
+* **$H_t$**: The set of "Control" factors (already accepted or benchmark factors).
+* **$g_t$**: The "Candidate" factor currently being tested.
 
-    def _get_dynamic_threshold(self, n_candidates):
-        """
-        Internal method to calculate t-threshold based on adjustment method.
-        """
-        if self.adjustment_method == 'bonferroni':
-            if n_candidates == 0:
-                return self.t_threshold
-            # Bonferroni correction: alpha / m
-            # We use two-tailed critical value
-            adj_alpha = self.significance_level / n_candidates
-            # ppf(1 - alpha/2) gives the critical t-value
-            critical_val = stats.norm.ppf(1 - adj_alpha / 2)
-            return critical_val
-        else:
-            # Default: Return the fixed threshold provided by user
-            return self.t_threshold
+### The Double-Selection Logic
+Standard OLS is unreliable when the number of potential controls in $H$ is large relative to the sample size. We employ a three-step procedure for every candidate $g$:
 
-    def first_stage_lasso(self, H_current):
-        lasso_cv = LassoCV(cv=self.cv, random_state=self.random_state).fit(H_current, self.r_bar)
-        coef = lasso_cv.coef_
-        indices = [i for i, c in enumerate(coef) if np.abs(c) > self.tol]
-        return indices, lasso_cv
+1.  **First Stage (LASSO on Returns):**
+    Select variables from $H$ that are useful for predicting returns ($r$).
+    $$r = H \theta + u$$
+2.  **Second Stage (LASSO on Candidate):**
+    Select variables from $H$ that are correlated with the candidate factor ($g$). This is crucial to remove omitted variable bias.
+    $$g = H \delta + v$$
+3.  **Post-Selection OLS:**
+    Run a standard OLS regression of $r$ on $g$ and the *union* of predictors selected in steps 1 and 2. The t-statistic of $g$ in this regression is the test statistic.
 
-    def second_stage_lasso(self, g_candidate, H_current):
-        lasso_cv = LassoCV(cv=self.cv, random_state=self.random_state).fit(H_current, g_candidate)
-        coef = lasso_cv.coef_
-        indices = [i for i, c in enumerate(coef) if np.abs(c) > self.tol]
-        return indices, lasso_cv
+---
 
-    def ols_regression_t_value(self, H_selected, g_candidate):
-        X = np.column_stack((H_selected, g_candidate))
-        X = sm.add_constant(X)
-        model = sm.OLS(self.r_bar, X).fit()
-        # The candidate factor is the last column (index -1)
-        t_value = np.abs(model.tvalues[-1])
-        return t_value, model
+## Class: `GlobalFactorSelector`
 
-    def post_selection_ols(self, H_final):
-        X = sm.add_constant(H_final)
-        model = sm.OLS(self.r_bar, X).fit()
-        return model
+### Initialization Parameters
 
-    def run(self):
-        # 1. Prepare Data (Scale if requested)
-        H_working, G_working = self._prepare_data()
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `r_bar` | Array | Required | Vector of average excess returns (risk premia). |
+| `H` | Matrix | Required | Matrix of control factors (benchmark models). |
+| `G` | Matrix | Required | Matrix of candidate factors (the "Zoo"). |
+| `candidate_categories` | Array | Required | Labels/IDs for candidate categories. Used to exclude correlated cluster members after a selection. |
+| `scale_inputs` | `bool` | `False` | **(Improvement)** If `True`, standardizes $H$ and $G$ to zero mean and unit variance. Highly recommended for LASSO. |
+| `adjustment_method` | `str` | `'none'` | **(Improvement)** Controls the t-stat threshold logic.<br>• `'none'`: Fixed threshold.<br>• `'bonferroni'`: Dynamic adjustment. |
+| `t_threshold` | `float` | `1.64` | The base critical value (approx. 90% confidence) if no adjustment is used. |
+| `significance_level` | `float` | `0.10` | The target alpha (e.g., 0.05 or 0.10) used when calculating dynamic Bonferroni corrections. |
 
-        n, _ = H_working.shape
-        k = G_working.shape[1]
-        candidate_indices = list(range(k))
-        selected_indices = []
-        selected_categories = set()
+---
 
-        H_current = H_working.copy()
-        iteration = 0
+## Algorithm Logic Flow
 
-        while candidate_indices:
-            best_t = 0
-            best_idx = None
+The `run()` method executes the following iterative loop:
 
-            # 2. Determine Threshold for this iteration
-            # If Bonferroni is on, this threshold will be high initially and decrease as candidates are removed.
-            current_threshold = self._get_dynamic_threshold(len(candidate_indices))
+1.  **Preprocessing:**
+    * If `scale_inputs` is active, $H$ and $G$ are standardized using `StandardScaler`.
+    * $r\_bar$ is left untouched (target variable).
 
-            # Loop through current candidates
-            for idx in candidate_indices:
-                g_candidate = G_working[:, idx]
+2.  **Iterative Loop:**
+    * While candidates remain in $G$:
+        1.  **Determine Threshold:**
+            * If `adjustment_method='bonferroni'`, calculate critical $t$ based on $\alpha / m$ (where $m$ is remaining candidates).
+            * Otherwise, use fixed `t_threshold`.
+        2.  **Scan Candidates:**
+            * For every remaining factor $g$ in $G$:
+                * Perform **Double-Selection LASSO**.
+                * Calculate the t-statistic for $g$ via OLS on the selected union of controls.
+        3.  **Selection Decision:**
+            * Identify the candidate with the **maximum t-statistic**.
+            * Compare max t-statistic to the current threshold.
+        4.  **Update or Stop:**
+            * **If t > Threshold:**
+                * Add $g$ to the control set $H$.
+                * Record the selection.
+                * **Exclusion Step:** Remove $g$ *and* all other candidates belonging to the same category/cluster from $G$ to prevent multicollinearity or redundant variations of the same signal.
+                * Repeat loop.
+            * **If t < Threshold:**
+                * Stop iteration. No further factors add explanatory power.
 
-                # Double Selection LASSO Logic
-                I1, _ = self.first_stage_lasso(H_current)
-                I2, _ = self.second_stage_lasso(g_candidate, H_current)
-                I3 = list(set(I1).union(set(I2)))
+---
 
-                if len(I3) == 0:
-                    H_selected = np.empty((n, 0))
-                else:
-                    H_selected = H_current[:, I3]
+## Improvements Explained
 
-                t_val, _ = self.ols_regression_t_value(H_selected, g_candidate)
+### 1. Feature Scaling (`scale_inputs`)
+LASSO regression penalizes the sum of absolute coefficients ($\lambda \sum |\beta|$). If factors have vastly different scales (e.g., one factor is 0.01 and another is 100), LASSO will unfairly penalize the larger-scaled variable even if it is predictive.
+* **Recommendation:** Always set to `True` unless data is pre-normalized.
 
-                if t_val > best_t:
-                    best_t = t_val
-                    best_idx = idx
+### 2. Bonferroni Correction (`adjustment_method`)
+In a "Factor Zoo" with hundreds of potential factors, testing them one by one increases the probability of finding a significant result purely by chance (False Positives).
+* **The Fix:** The threshold becomes stricter as the number of candidates ($m$) increases.
+* **Formula:** Critical value corresponds to $p < \frac{\alpha}{m}$.
+* **Dynamics:** As factors are selected and categories removed, $m$ decreases, slightly relaxing the threshold for subsequent iterations.
 
-            # 3. Evaluation against (potentially dynamic) threshold
-            if best_t > current_threshold:
-                cat = self.candidate_categories[best_idx]
+---
 
-                print(f"Iter {iteration}: Selected Index {best_idx} (Cat {cat}) "
-                      f"| t-stat: {best_t:.2f} > Threshold: {current_threshold:.2f}")
+## Outputs
 
-                # Add selected factor to Control set H
-                H_current = np.column_stack((H_current, G_working[:, best_idx]))
-                selected_indices.append(best_idx)
-                selected_categories.add(cat)
+The `run()` method returns:
 
-                # Remove all candidates from the same category
-                old_len = len(candidate_indices)
-                candidate_indices = [idx for idx in candidate_indices
-                                     if self.candidate_categories[idx] != cat]
-                removed_count = old_len - len(candidate_indices)
-                print(f"   -> Removed {removed_count} candidates from Category {cat}")
-
-                iteration += 1
-            else:
-                print(f"Stop: Best t-stat {best_t:.2f} did not exceed threshold {current_threshold:.2f}")
-                break
-
-        final_model = self.post_selection_ols(H_current)
-        return H_current, selected_indices, list(selected_categories), final_model
-
-# =============================================================================
-# Updated Scenario Execution
-# =============================================================================
-if __name__ == "__main__":
-    np.random.seed(42)
-    n, m, k = 100, 1, 152
-
-    r_bar = np.random.randn(n)
-    H = np.random.randn(n, m)
-    # Intentionally add scale difference to demonstrate scaling need
-    G = np.random.randn(n, k) * 10
-    candidate_categories = np.random.choice(np.arange(1, 14), size=k)
-
-    print("=== Running with Improvements ===")
-    # Enable scaling and Bonferroni correction
-    selector = GlobalFactorSelector(
-        r_bar, H, G, candidate_categories,
-        cv=5,
-        random_state=42,
-        scale_inputs=True,           # IMPROVEMENT 1: Enable Scaling
-        adjustment_method='bonferroni', # IMPROVEMENT 2: Enable Correction
-        significance_level=0.05      # Target 5% significance
-    )
-
-    H_final, selected_indices, selected_categories, final_model = selector.run()
-
-    print("\nFinal Results:")
-    print("Selected Indices:", selected_indices)
-    print("Selected Categories:", selected_categories)
-    print(final_model.summary())
+1.  **`H_final`**: The final matrix of control factors (Original $H$ + Newly Selected Factors).
+2.  **`selected_indices`**: The column indices of the factors selected from the original $G$ matrix.
+3.  **`selected_categories`**: A list of the unique categories associated with the selected factors.
+4.  **`final_model`**: A `statsmodels` OLS regression result object using the final set of factors, allowing for immediate inspection of $R^2$ and coefficients.
